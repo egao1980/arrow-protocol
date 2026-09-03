@@ -973,10 +973,11 @@
                  (hw (make-tw))
                  (idxs (map 'vector (lambda (v) (gethash v seen)) present))
                  (bw (max 1 (%bit-width (1- (max 1 (length dict)))))))
-            (write-page-header hw :dictionary (length dict-bytes) (length dict-bytes)
-                               :dict-values (length dict) :encoding :plain)
-            (push (tw-bytes hw) parts)
-            (push dict-bytes parts)
+            (let ((dict-comp (parquet-compress compression dict-bytes)))
+              (write-page-header hw :dictionary (length dict-bytes) (length dict-comp)
+                                 :dict-values (length dict) :encoding :plain)
+              (push (tw-bytes hw) parts)
+              (push dict-comp parts))
             (setf dict-off t)
             (push :rle-dictionary encodings)
             (setf value-enc (encode-rle-dictionary idxs bw))))
@@ -1066,6 +1067,24 @@
     (t (error 'arrow-unsupported-type :feature encoding
               :message "unsupported page encoding"))))
 
+(defun %decompress-page-body (codec hdr body)
+  "Skip the column codec when the page is stored uncompressed.
+   Dictionary pages are often left uncompressed (comp == uncomp) even when
+   the chunk codec is gzip/snappy/… — feeding those bytes to chipz/etc. fails."
+  (cond
+    ((or (eq codec :uncompressed)
+         (= (getf hdr :comp) (getf hdr :uncomp)))
+     body)
+    ((eq (getf hdr :type) :data-v2)
+     (if (not (getf hdr :v2-compressed))
+         body
+         (let* ((rl (getf hdr :rep-len))
+                (dl (getf hdr :def-len))
+                (head (subseq body 0 (+ rl dl)))
+                (tail (parquet-decompress codec (subseq body (+ rl dl)))))
+           (%concat-octets head tail))))
+    (t (parquet-decompress codec body))))
+
 (defun decode-column-chunk (octets meta leaf &key footer-key column-keys
                             key-retriever file-aad row-group-i column-i)
   (let* ((codec (getf meta :codec))
@@ -1104,17 +1123,7 @@
                                                   footer-key column-keys
                                                   key-retriever nil)))
                      (setf body (decrypt-module body key aad))))
-                 (let ((plain (if (and (eq (getf hdr :type) :data-v2)
-                                       (not (getf hdr :v2-compressed)))
-                                  body
-                                  (if (eq (getf hdr :type) :data-v2)
-                                      (let* ((rl (getf hdr :rep-len))
-                                             (dl (getf hdr :def-len))
-                                             (head (subseq body 0 (+ rl dl)))
-                                             (tail (parquet-decompress codec
-                                                    (subseq body (+ rl dl)))))
-                                        (%concat-octets head tail))
-                                      (parquet-decompress codec body)))))
+                 (let ((plain (%decompress-page-body codec hdr body)))
                    (case (getf hdr :type)
                      (:dictionary
                       (setf dict (plain-decode plain 0 (length plain) physical spec

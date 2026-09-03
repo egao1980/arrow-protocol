@@ -129,6 +129,14 @@
                        :format :parquet :compression :lz4)
                'arrow-unsupported-type)))
 
+(deftest parquet-uncompressed-dict-page-skips-codec
+  ;; PLAIN int32 dict page: two values, stored uncompressed under a gzip chunk codec.
+  (let* ((body (make-array 8 :element-type '(unsigned-byte 8)
+                           :initial-contents '(1 0 0 0 2 0 0 0)))
+         (hdr (list :type :dictionary :comp 8 :uncomp 8 :num-values 2)))
+    (ok (equalp body
+                (arrow-protocol::%decompress-page-body :gzip hdr body)))))
+
 (deftest parquet-codecs-when-loaded
   (let* ((schema (make-arrow-schema
                   (list (make-arrow-field :name "c" :type :int32))))
