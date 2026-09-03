@@ -161,10 +161,16 @@
                              :compression :uncompressed
                              :dictionary nil
                              :footer-key key))
-             (back (decode octets :format :parquet :footer-key key)))
+             (back (decode octets :format :parquet :footer-key key))
+             (back-d (decode (encode table :format :parquet
+                                     :compression :uncompressed
+                                     :dictionary t
+                                     :footer-key key)
+                             :format :parquet :footer-key key)))
         (ok (equalp (subseq octets 0 4)
                     (map 'vector #'char-code "PARE")))
-        (ok (table= table back)))))
+        (ok (table= table back))
+        (ok (table= table back-d)))))
 
 (deftest parquet-magic
   (let* ((table (table-from-rows (list (ht "c" 1))

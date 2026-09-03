@@ -974,6 +974,14 @@
                  (idxs (map 'vector (lambda (v) (gethash v seen)) present))
                  (bw (max 1 (%bit-width (1- (max 1 (length dict)))))))
             (let ((dict-comp (parquet-compress compression dict-bytes)))
+              (when footer-key
+                (setf dict-comp
+                      (encrypt-module dict-comp
+                                      (resolve-column-key (pq-node-path leaf) footer-key
+                                                          column-keys nil nil)
+                                      (parquet-aad file-aad +mod-dict-page+
+                                                   :row-group row-group-i
+                                                   :column column-i))))
               (write-page-header hw :dictionary (length dict-bytes) (length dict-comp)
                                  :dict-values (length dict) :encoding :plain)
               (push (tw-bytes hw) parts)
@@ -992,27 +1000,28 @@
                       (replace o value-enc :start1 p)
                       o))
            (comp (parquet-compress compression payload))
+           (body (if footer-key
+                     (encrypt-module
+                      comp
+                      (resolve-column-key (pq-node-path leaf) footer-key
+                                          column-keys nil nil)
+                      (parquet-aad file-aad +mod-data-page+
+                                   :row-group row-group-i
+                                   :column column-i :page 0))
+                     comp))
            (hw (make-tw)))
-      (write-page-header hw :data (length payload) (length comp)
+      (write-page-header hw :data (length payload) (length body)
                          :num-values n :encoding (if (member enc '(:rle-dictionary :plain-dictionary))
                                                      :rle-dictionary
                                                      enc)
                          :def-enc :rle :rep-enc :rle)
-      (let ((header (tw-bytes hw))
-            (body comp))
-        (when footer-key
-          (let ((aad (parquet-aad file-aad +mod-data-page+
-                                  :row-group row-group-i :column column-i :page 0))
-                (key (resolve-column-key (pq-node-path leaf) footer-key
-                                         column-keys nil nil)))
-            (setf body (encrypt-module body key aad))))
-        (push header parts)
-        (push body parts))
+      (push (tw-bytes hw) parts)
+      (push body parts)
       (values (apply #'%concat-octets (nreverse parts))
               (delete-duplicates encodings)
               dict-off
               (length payload)
-              (length comp)))))
+              (length body)))))
 
 (defun %concat-octets (&rest parts)
   (let* ((n (loop for p in parts sum (length p)))
