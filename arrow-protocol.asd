@@ -3,10 +3,11 @@
   :description "CLOS Apache Arrow / Parquet for cl-stack; implements serdes-protocol :arrow / :parquet"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("babel" "serdes-protocol")
+  :depends-on ("babel" "serdes-protocol" "encoding-protocol")
   :properties (:cl-repo
                (:ci (:with ("cl-stack-snappy" "cl-stack-zstd" "cl-stack-brotli"
-                            "chipz" "salza2" "crypto-backend-ironclad"))))
+                            "chipz" "salza2" "crypto-backend-ironclad")
+                     :sources (("encoding-protocol" :oci)))))
   :serial t
   :pathname "src"
   :components ((:file "package")
