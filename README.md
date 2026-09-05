@@ -28,6 +28,10 @@ Missing values are `:null` (boolean `nil` stays false). Timestamps are epoch int
 
 **Write defaults:** parquet uses dictionary + snappy when `cl-stack-snappy` is loaded, else uncompressed. Nested write is compliant 3-level LIST. Encryption is `AES_GCM_V1` via `crypto-protocol` (`:footer-key`).
 
+Parquet footer field 5 (`key_value_metadata`) stores **`ARROW:schema`** by default — base64 of the IPC schema message, same convention as pyarrow / Arrow C++ `store_schema()`. `:store-schema nil` omits it; decode then uses the SchemaElement tree. `parquet-schema` / `parquet-key-value-metadata` read the footer only.
+
+`parquet-schema` → `arrow-schema` is faithful when field 5 is present. Compiling that to `defschema` is still lossy — go through [`schema-protocol-arrow`](https://github.com/egao1980/schema-protocol-arrow) `parse-schema` / `:format :arrow`.
+
 **Soft natives:** `cl-stack-snappy` / `cl-stack-zstd` / `cl-stack-brotli` / chipz+salza2 (gzip). Missing decode codec → `arrow-unsupported-type`.
 
 Deferred: Arrow dictionary/union/extension, Flight, C Data Interface, `AES_GCM_CTR_V1`, KMS.

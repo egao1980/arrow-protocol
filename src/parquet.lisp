@@ -313,7 +313,14 @@
                       (pq-node-type leaf)))
   (tw-end-struct w))
 
-(defun write-file-metadata (w root num-rows row-groups created-by)
+(defun write-key-value (w key value)
+  (tw-start-struct w)
+  (tw-bin w 1 key)
+  (when value (tw-bin w 2 value))
+  (tw-end-struct w))
+
+(defun write-file-metadata (w root num-rows row-groups created-by
+                            &key key-value-metadata)
   (tw-start-struct w)
   (tw-i32 w 1 1)
   (let ((elems (pq-schema-elements root)))
@@ -338,6 +345,10 @@
     (tw-i64 w 2 (getf rg :total-byte-size))
     (tw-i64 w 3 (getf rg :num-rows))
     (tw-end-struct w))
+  (when key-value-metadata
+    (tw-list w 5 +t-struct+ (length key-value-metadata))
+    (dolist (kv key-value-metadata)
+      (write-key-value w (car kv) (cdr kv))))
   (when created-by (tw-bin w 6 created-by))
   (tw-end-struct w))
 
@@ -500,10 +511,24 @@
           (t (tr-skip r ty)))))
     (list :columns cols :total-byte-size bytes :num-rows nrows)))
 
+(defun read-key-value (r)
+  (tr-start-struct r)
+  (let ((key nil) (value nil))
+    (loop
+      (multiple-value-bind (id ty) (tr-field r)
+        (when (eq id :stop)
+          (tr-end-struct r)
+          (return))
+        (case id
+          (1 (setf key (tr-string r)))
+          (2 (setf value (tr-string r)))
+          (t (tr-skip r ty)))))
+    (cons key value)))
+
 (defun read-file-metadata (buf)
   (let ((r (make-tr :buf buf)))
     (tr-start-struct r)
-    (let ((version 1) (schema '()) (nrows 0) (rgs '()) (created nil))
+    (let ((version 1) (schema '()) (nrows 0) (rgs '()) (created nil) (kv '()))
       (loop
         (multiple-value-bind (id ty) (tr-field r)
           (when (eq id :stop)
@@ -518,10 +543,13 @@
             (4 (multiple-value-bind (n et) (tr-list-header r)
                  (declare (ignore et))
                  (setf rgs (loop repeat n collect (read-row-group r)))))
+            (5 (multiple-value-bind (n et) (tr-list-header r)
+                 (declare (ignore et))
+                 (setf kv (loop repeat n collect (read-key-value r)))))
             (6 (setf created (tr-string r)))
             (t (tr-skip r ty)))))
       (list :version version :schema schema :num-rows nrows
-            :row-groups rgs :created-by created))))
+            :row-groups rgs :created-by created :key-value-metadata kv))))
 
 (defun %arrow-from-elem (el)
   (let* ((phys (getf el :type))
@@ -639,6 +667,43 @@
                                :type (or (pq-node-arrow-type ch) :null)
                                :nullable (not (eq (pq-node-repetition ch) :required))))
            (pq-node-children root))))
+
+(defun %base64-encode (octets)
+  (encoding-protocol:encode octets :encoding :base64))
+
+(defun %base64-decode (string)
+  (handler-case
+      (encoding-protocol:decode string :encoding :base64)
+    (encoding-protocol:encoding-decode-error (c)
+      (error 'arrow-decode-error
+             :message (or (encoding-protocol:encoding-error-message c)
+                          "invalid base64")))))
+
+(defun %arrow-schema-ipc-bytes (schema)
+  (%encapsulate (%schema-message schema) #()))
+
+(defun %arrow-schema-from-kv (kv)
+  "IPC arrow-schema from field-5 ARROW:schema, or NIL."
+  (let ((b64 (cdr (assoc "ARROW:schema" kv :test #'string=))))
+    (when (and b64 (plusp (length b64)))
+      (restart-case
+          (multiple-value-bind (schema batches)
+              (%parse-messages (%base64-decode b64))
+            (declare (ignore batches))
+            (unless schema
+              (error 'arrow-decode-error
+                     :message "ARROW:schema is not an IPC schema"))
+            schema)
+        (continue ()
+          :report "Ignore ARROW:schema and use the Parquet SchemaElement tree"
+          nil)))))
+
+(defun %prefer-stored-schema (stored tree)
+  (if (and stored
+           (= (length (arrow-schema-fields stored))
+              (length (arrow-schema-fields tree))))
+      stored
+      tree))
 
 ;;; PLAIN
 
@@ -1201,7 +1266,8 @@
 (defun encode-parquet (table &key (compression nil) (dictionary t) encoding
                        row-group-size
                        footer-key column-keys key-retriever
-                       plaintext-footer)
+                       plaintext-footer
+                       (store-schema t) key-value-metadata)
   (declare (ignore row-group-size))
   (let* ((table (if (arrow-record-batch-p table)
                     (make-table (arrow-record-batch-schema table)
@@ -1260,8 +1326,14 @@
     (let* ((rg (list :columns col-metas
                      :total-byte-size (loop for c in col-metas sum (getf c :comp))
                      :num-rows nrows))
-           (mw (make-tw)))
-      (write-file-metadata mw root nrows (list rg) "arrow-protocol 0.1.0")
+           (mw (make-tw))
+           (kv (copy-list key-value-metadata)))
+      (when (and store-schema (not (assoc "ARROW:schema" kv :test #'string=)))
+        (push (cons "ARROW:schema"
+                    (%base64-encode (%arrow-schema-ipc-bytes schema)))
+              kv))
+      (write-file-metadata mw root nrows (list rg) "arrow-protocol 0.1.1"
+                           :key-value-metadata kv)
       (let* ((meta (tw-bytes mw))
              (magic (if encrypted +pare+ +par1+))
              (body (%concat-octets (apply #'%concat-octets chunks))))
@@ -1303,7 +1375,8 @@
 (defun %read-u32-end (octets pos)
   (%u32le octets pos))
 
-(defun decode-parquet (octets &key columns footer-key column-keys key-retriever)
+(defun %read-parquet-file-metadata (octets &key footer-key)
+  "Return (values FileMetaData-plist file-aad)."
   (when (< (length octets) 8)
     (error 'arrow-decode-error :message "truncated parquet"))
   (let* ((head (subseq octets 0 4))
@@ -1354,8 +1427,37 @@
          (when (and footer-key (> (- (length octets) 8) (+ mstart mlen 28)))
            nil)
          (setf meta-octets (subseq octets mstart (+ mstart mlen))))))
-    (let* ((md (read-file-metadata meta-octets))
-           (root (%build-pq-forest (getf md :schema))))
+    (values (read-file-metadata meta-octets) file-aad)))
+
+(defun parquet-key-value-metadata (octets &key footer-key)
+  "FileMetaData.key_value_metadata (field 5) as (key . value) conses."
+  (getf (%read-parquet-file-metadata octets :footer-key footer-key)
+        :key-value-metadata))
+
+(defun parquet-schema (octets &key footer-key)
+  "Arrow schema from a Parquet footer.
+
+   Prefers field-5 `ARROW:schema` (base64 IPC schema message, pyarrow default).
+   Falls back to the SchemaElement tree. The IPC path is faithful Arrow;
+   compiling that to defschema is still lossy — use schema-protocol-arrow
+   `parse-schema` / `:format :arrow` for that step."
+  (let* ((md (%read-parquet-file-metadata octets :footer-key footer-key))
+         (root (%build-pq-forest (getf md :schema)))
+         (tree (progn (%annotate-levels root 0 0 nil)
+                      (pq-tree-to-arrow-schema root)))
+         (stored (handler-bind
+                     ((arrow-decode-error
+                       (lambda (c)
+                         (declare (ignore c))
+                         (let ((r (find-restart 'continue)))
+                           (when r (invoke-restart r))))))
+                   (%arrow-schema-from-kv (getf md :key-value-metadata)))))
+    (%prefer-stored-schema stored tree)))
+
+(defun decode-parquet (octets &key columns footer-key column-keys key-retriever)
+  (multiple-value-bind (md file-aad)
+      (%read-parquet-file-metadata octets :footer-key footer-key)
+    (let ((root (%build-pq-forest (getf md :schema))))
       (%annotate-levels root 0 0 nil)
       (let* ((want (when columns
                      (mapcar (lambda (c) (if (stringp c) c (string-downcase (string c))))
@@ -1388,7 +1490,15 @@
                                                 (concatenate 'vector (third prev) (third decoded))))
                                     (setf (gethash key leaf-table) decoded))))))
         (let* ((arrays (unshred-tree root leaf-table))
-               (arrow (pq-tree-to-arrow-schema root)))
+               (tree (pq-tree-to-arrow-schema root))
+               (stored (handler-bind
+                           ((arrow-decode-error
+                             (lambda (c)
+                               (declare (ignore c))
+                               (let ((r (find-restart 'continue)))
+                                 (when r (invoke-restart r))))))
+                         (%arrow-schema-from-kv (getf md :key-value-metadata))))
+               (arrow (%prefer-stored-schema stored tree)))
           (when want
             (let* ((keep (loop for f in (arrow-schema-fields arrow)
                                for a in arrays

@@ -50,6 +50,17 @@
          (want (expected-table "scalars.sexp" (scalars-schema))))
     (ok (table= want back))))
 
+(deftest pyarrow-parquet-arrow-schema
+  (let* ((octets (read-octets-file (fixture-path "scalars.parquet")))
+         (kv (parquet-key-value-metadata octets))
+         (stored (parquet-schema octets)))
+    (ok (assoc "ARROW:schema" kv :test #'string=))
+    (ok (equal '("n" "s" "ok")
+               (mapcar #'arrow-field-name (arrow-schema-fields stored))))
+    (ok (eq :int32 (arrow-field-type (first (arrow-schema-fields stored)))))
+    (ok (eq :utf8 (arrow-field-type (second (arrow-schema-fields stored)))))
+    (ok (eq :bool (arrow-field-type (third (arrow-schema-fields stored)))))))
+
 (deftest pyarrow-default-snappy
   (if (not (arrow-protocol::parquet-codec-available-p :snappy))
       (ok t "cl-stack-snappy not loaded")

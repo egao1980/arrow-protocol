@@ -66,6 +66,8 @@
            #:decode-ipc
            #:encode-parquet
            #:decode-parquet
+           #:parquet-schema
+           #:parquet-key-value-metadata
 
            #:arrow-serdes-backend
            #:parquet-serdes-backend
