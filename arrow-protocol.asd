@@ -1,5 +1,5 @@
 (defsystem "arrow-protocol"
-  :version "0.1.0"
+  :version "0.1.1"
   :description "CLOS Apache Arrow / Parquet for cl-stack; implements serdes-protocol :arrow / :parquet"
   :author "egao1980"
   :license "MIT"

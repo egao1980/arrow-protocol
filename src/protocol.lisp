@@ -15,7 +15,8 @@
                        compression dictionary encoding
                        row-group-size
                        footer-key column-keys key-retriever
-                       plaintext-footer)
+                       plaintext-footer
+                       (store-schema t) key-value-metadata)
   "Encode VALUE. FORMAT is :arrow (IPC file) or :parquet."
   (let ((table (%as-table value :schema schema)))
     (ecase format
@@ -28,7 +29,9 @@
                                 :footer-key footer-key
                                 :column-keys column-keys
                                 :key-retriever key-retriever
-                                :plaintext-footer plaintext-footer)))))
+                                :plaintext-footer plaintext-footer
+                                :store-schema store-schema
+                                :key-value-metadata key-value-metadata)))))
 
 (defun decode (source &key (format :arrow) columns
                         footer-key column-keys key-retriever)

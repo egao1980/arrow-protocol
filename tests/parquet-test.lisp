@@ -179,3 +179,47 @@
          (octets (encode table :format :parquet :compression :uncompressed :dictionary nil)))
     (ok (equalp (subseq octets 0 4)
                 (map 'vector #'char-code "PAR1")))))
+
+(deftest-parametrize parquet-base64
+    ((plain b64)
+     ("" "")
+     ("f" "Zg==")
+     ("fo" "Zm8=")
+     ("foo" "Zm9v")
+     ("foob" "Zm9vYg==")
+     ("fooba" "Zm9vYmE=")
+     ("foobar" "Zm9vYmFy"))
+  (let ((octets (babel:string-to-octets plain :encoding :utf-8)))
+    (ok (string= b64 (arrow-protocol::%base64-encode octets)))
+    (ok (equalp octets (arrow-protocol::%base64-decode b64)))))
+
+(deftest parquet-arrow-schema-kv
+  (let* ((schema (make-arrow-schema
+                  (list (make-arrow-field :name "n" :type :int32)
+                        (make-arrow-field :name "s" :type :utf8))))
+         (table (table-from-rows (list (ht "n" 1 "s" "a")) :schema schema))
+         (octets (encode table :format :parquet
+                         :compression :uncompressed :dictionary nil))
+         (kv (parquet-key-value-metadata octets))
+         (stored (parquet-schema octets))
+         (back (decode octets :format :parquet)))
+    (ok (assoc "ARROW:schema" kv :test #'string=))
+    (ok (equal '("n" "s")
+               (mapcar #'arrow-field-name (arrow-schema-fields stored))))
+    (ok (equal '(:int32 :utf8)
+               (mapcar #'arrow-field-type (arrow-schema-fields stored))))
+    (ok (table= table back))))
+
+(deftest parquet-store-schema-nil
+  (let* ((schema (make-arrow-schema
+                  (list (make-arrow-field :name "n" :type :int32))))
+         (table (table-from-rows (list (ht "n" 7)) :schema schema))
+         (octets (encode table :format :parquet
+                         :compression :uncompressed :dictionary nil
+                         :store-schema nil))
+         (kv (parquet-key-value-metadata octets))
+         (stored (parquet-schema octets)))
+    (ok (null (assoc "ARROW:schema" kv :test #'string=)))
+    (ok (equal '("n") (mapcar #'arrow-field-name (arrow-schema-fields stored))))
+    (ok (eq :int32 (arrow-field-type (first (arrow-schema-fields stored)))))
+    (ok (table= table (decode octets :format :parquet)))))
