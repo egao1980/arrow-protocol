@@ -6,8 +6,7 @@
   :depends-on ("babel" "serdes-protocol" "encoding-protocol")
   :properties (:cl-repo
                (:ci (:with ("cl-stack-snappy" "cl-stack-zstd" "cl-stack-brotli"
-                            "chipz" "salza2" "crypto-backend-ironclad")
-                     :sources (("encoding-protocol" :oci)))))
+                            "chipz" "salza2" "crypto-backend-ironclad"))))
   :serial t
   :pathname "src"
   :components ((:file "package")
