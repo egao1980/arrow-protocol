@@ -1155,9 +1155,10 @@
          (let* ((rl (getf hdr :rep-len))
                 (dl (getf hdr :def-len))
                 (head (subseq body 0 (+ rl dl)))
-                (tail (parquet-decompress codec (subseq body (+ rl dl)))))
+                (tail (parquet-decompress codec (subseq body (+ rl dl))
+                                         :max-output (- (getf hdr :uncomp) rl dl))))
            (%concat-octets head tail))))
-    (t (parquet-decompress codec body))))
+    (t (parquet-decompress codec body :max-output (getf hdr :uncomp)))))
 
 (defun decode-column-chunk (octets meta leaf &key footer-key column-keys
                             key-retriever file-aad row-group-i column-i)

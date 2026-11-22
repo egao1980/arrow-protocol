@@ -223,3 +223,35 @@
     (ok (equal '("n") (mapcar #'arrow-field-name (arrow-schema-fields stored))))
     (ok (eq :int32 (arrow-field-type (first (arrow-schema-fields stored)))))
     (ok (table= table (decode octets :format :parquet)))))
+
+;;; Decompression bombs: page output is bounded by the header's uncompressed size.
+
+(defun %zeros (n) (make-array n :element-type '(unsigned-byte 8) :initial-element 0))
+
+(deftest-parametrize parquet-decompression-bomb
+    ((codec)
+     (:gzip) (:zstd) (:brotli) (:snappy))
+  (if (not (arrow-protocol::parquet-codec-available-p codec))
+      (skip (format nil "~S codec not loaded" codec))
+      (let* ((bomb (arrow-protocol::parquet-compress codec (%zeros (* 8 1024 1024))))
+             (hdr (list :type :data :comp (length bomb) :uncomp 1024 :num-values 1)))
+        (ok (< (length bomb) (* 1024 1024)) "8 MiB of zeros compresses small")
+        (ok (signals (arrow-protocol::%decompress-page-body codec hdr bomb)
+                     'arrow-protocol:arrow-decode-error))
+        (ok (signals (arrow-protocol::parquet-decompress codec bomb :max-output 1024)
+                     'arrow-protocol:arrow-decode-error))
+        (testing "a page that inflates to less than it declares is rejected too"
+          (let ((small (arrow-protocol::parquet-compress codec (%zeros 10))))
+            (ok (signals (arrow-protocol::parquet-decompress codec small :max-output 20)
+                         'arrow-protocol:arrow-decode-error))
+            (ok (equalp (%zeros 10)
+                        (arrow-protocol::parquet-decompress codec small :max-output 10))))))))
+
+(deftest parquet-snappy-declared-length-checked-first
+  (if (not (arrow-protocol::parquet-codec-available-p :snappy))
+      (skip "snappy codec not loaded")
+      ;; Preamble declares ~4 GiB; must fail before the backend allocates it.
+      (ok (signals (arrow-protocol::parquet-decompress
+                    :snappy (coerce #(#xFF #xFF #xFF #xFF #x0F 0 0) '(vector (unsigned-byte 8)))
+                    :max-output 64)
+                   'arrow-protocol:arrow-decode-error))))

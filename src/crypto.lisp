@@ -49,12 +49,11 @@
       out)))
 
 (defun %random-bytes (n)
+  "N CSPRNG octets from crypto-protocol. No CL RANDOM fallback: file AADs and
+   keys must be unpredictable."
   (let ((fn (%find-fn :crypto-protocol "GENERATE-KEY")))
-    (if fn
-        (funcall fn :nbytes n)
-        (let ((b (make-array n :element-type '(unsigned-byte 8))))
-          (dotimes (i n) (setf (aref b i) (random 256)))
-          b))))
+    (unless fn (%need-crypto))
+    (funcall fn :nbytes n)))
 
 (defun encrypt-module (plaintext key aad)
   (%need-crypto)
