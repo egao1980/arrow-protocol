@@ -1,6 +1,10 @@
 (in-package #:arrow-protocol)
 
-;;; Soft-load compressors. Missing decode codec → arrow-unsupported-type.
+;;; Parquet page codecs through compression-protocol. The codec backends
+;;; (compression-backend-chipz, cl-stack-snappy, cl-stack-zstd,
+;;; cl-stack-brotli) stay optional: a missing codec → arrow-unsupported-type.
+;;; Decompression is bounded by the page header's uncompressed size, so an
+;;; untrusted file cannot inflate past what it declares (decompression bomb).
 
 (defun %find-fn (package name)
   (let ((p (find-package package)))
@@ -8,18 +12,27 @@
       (let ((s (find-symbol name p)))
         (when (and s (fboundp s)) s)))))
 
-(defun parquet-codec-available-p (codec)
+(defun %codec-algorithm (codec)
+  "Parquet codec → compression-protocol algorithm keyword."
   (ecase codec
-    (:uncompressed t)
-    (:snappy (and (%find-fn :cl-stack-snappy "COMPRESS")
-                  (%find-fn :cl-stack-snappy "DECOMPRESS")))
-    (:gzip (and (%find-fn :salza2 "COMPRESS-DATA")
-                (%find-fn :chipz "DECOMPRESS")))
-    (:zstd (and (%find-fn :cl-stack-zstd "COMPRESS")
-                (%find-fn :cl-stack-zstd "DECOMPRESS")))
-    (:brotli (and (%find-fn :cl-stack-brotli "COMPRESS")
-                  (%find-fn :cl-stack-brotli "DECOMPRESS")))
+    (:snappy :snappy) (:gzip :gzip) (:zstd :zstd) (:brotli :brotli)
     ((:lz4 :lzo :lz4-raw) nil)))
+
+(defun %codec-loaded-p (algorithm generic)
+  "True when a backend method on GENERIC applies to ALGORITHM, beyond the
+   protocol's default method (which signals unsupported-algorithm)."
+  (and algorithm
+       (> (length (compute-applicable-methods
+                   generic (list algorithm (make-array 0 :element-type '(unsigned-byte 8)))))
+          1)))
+
+(defun parquet-codec-available-p (codec)
+  (if (eq codec :uncompressed)
+      t
+      (let ((algorithm (%codec-algorithm codec)))
+        (and (%codec-loaded-p algorithm #'compression-protocol:compress-using-algorithm)
+             (%codec-loaded-p algorithm
+                              #'compression-protocol:make-decompressing-stream-using-algorithm)))))
 
 (defun default-parquet-compression ()
   (if (parquet-codec-available-p :snappy) :snappy :uncompressed))
@@ -27,10 +40,10 @@
 (defun %missing-codec (codec)
   (error 'arrow-unsupported-type
          :feature codec
-         :message (format nil "load ~A to ~A-decompress this file"
+         :message (format nil "load ~A to ~A-(de)compress this file"
                           (ecase codec
                             (:snappy "cl-stack-snappy")
-                            (:gzip "chipz")
+                            (:gzip "compression-backend-chipz")
                             (:zstd "cl-stack-zstd")
                             (:brotli "cl-stack-brotli")
                             ((:lz4 :lz4-raw) "lz4 is not supported")
@@ -38,54 +51,52 @@
                           codec)))
 
 (defun parquet-compress (codec octets)
-  (ecase codec
-    (:uncompressed octets)
-    (:snappy
-     (let ((fn (%find-fn :cl-stack-snappy "COMPRESS")))
-       (unless fn (%missing-codec :snappy))
-       (funcall fn octets)))
-    (:gzip
-     (let ((fn (%find-fn :salza2 "COMPRESS-DATA"))
-           (cls (let ((p (find-package :salza2)))
-                  (when p (find-symbol "GZIP-COMPRESSOR" p)))))
-       (unless (and fn cls) (%missing-codec :gzip))
-       (funcall fn octets cls)))
-    (:zstd
-     (let ((fn (%find-fn :cl-stack-zstd "COMPRESS")))
-       (unless fn (%missing-codec :zstd))
-       (funcall fn octets)))
-    (:brotli
-     (let ((fn (%find-fn :cl-stack-brotli "COMPRESS")))
-       (unless fn (%missing-codec :brotli))
-       (funcall fn octets)))
-    ((:lz4 :lzo :lz4-raw)
-     (error 'arrow-unsupported-type :feature codec
-            :message "lz4/lzo are not supported"))))
+  (cond
+    ((eq codec :uncompressed) octets)
+    ((not (parquet-codec-available-p codec)) (%missing-codec codec))
+    (t (compression-protocol:compress octets :algorithm (%codec-algorithm codec)))))
 
-(defun parquet-decompress (codec octets)
-  (ecase codec
-    (:uncompressed octets)
-    (:snappy
-     (let ((fn (%find-fn :cl-stack-snappy "DECOMPRESS")))
-       (unless fn (%missing-codec :snappy))
-       (funcall fn octets)))
-    (:gzip
-     (let ((fn (%find-fn :chipz "DECOMPRESS"))
-           (fmt (let ((p (find-package :chipz)))
-                  (when p (find-symbol "GZIP" p)))))
-       (unless (and fn fmt) (%missing-codec :gzip))
-       (funcall fn nil fmt octets)))
-    (:zstd
-     (let ((fn (%find-fn :cl-stack-zstd "DECOMPRESS")))
-       (unless fn (%missing-codec :zstd))
-       (funcall fn octets)))
-    (:brotli
-     (let ((fn (%find-fn :cl-stack-brotli "DECOMPRESS")))
-       (unless fn (%missing-codec :brotli))
-       (funcall fn octets)))
-    ((:lz4 :lzo :lz4-raw)
-     (error 'arrow-unsupported-type :feature codec
-            :message "lz4/lzo are not supported"))))
+(defun %snappy-declared-length (octets)
+  "Raw Snappy starts with the uncompressed length as a uvarint (≤ 5 bytes)."
+  (let ((n 0))
+    (loop for i from 0 below (min 5 (length octets))
+          for b = (aref octets i)
+          do (setf n (logior n (ash (logand b #x7f) (* 7 i))))
+             (when (zerop (logand b #x80))
+               (return-from %snappy-declared-length n)))
+    (error 'arrow-decode-error :message "truncated Snappy length preamble")))
+
+(defun parquet-decompress (codec octets &key max-output)
+  "Decompress a Parquet page body. MAX-OUTPUT (the page's declared
+   uncompressed size) bounds the output: more bytes, or a different count,
+   signals ARROW-DECODE-ERROR. NIL means unbounded (trusted input only)."
+  (cond
+    ((eq codec :uncompressed) octets)
+    ((not (parquet-codec-available-p codec)) (%missing-codec codec))
+    (t
+     ;; cl-stack-snappy materializes its declared length before any stream
+     ;; read, so check the preamble first (cl-stack-snappy#10).
+     (when (and max-output (eq codec :snappy)
+                (> (%snappy-declared-length octets) max-output))
+       (error 'arrow-decode-error
+              :message (format nil "Snappy page declares ~D bytes, header allows ~D"
+                               (%snappy-declared-length octets) max-output)))
+     (let ((out (handler-case
+                    (compression-protocol:decompress octets
+                                                     :algorithm (%codec-algorithm codec)
+                                                     :max-output max-output)
+                  (compression-protocol:compression-limit-exceeded ()
+                    (error 'arrow-decode-error
+                           :message (format nil "~A page inflates past its declared ~D bytes"
+                                            codec max-output)))
+                  (compression-protocol:compression-error (e)
+                    (error 'arrow-decode-error
+                           :message (format nil "~A page: ~A" codec e))))))
+       (when (and max-output (/= (length out) max-output))
+         (error 'arrow-decode-error
+                :message (format nil "~A page inflates to ~D bytes, header says ~D"
+                                 codec (length out) max-output)))
+       out))))
 
 (defun codec-id (codec)
   (ecase codec

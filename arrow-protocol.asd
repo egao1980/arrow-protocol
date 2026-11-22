@@ -1,12 +1,13 @@
 (defsystem "arrow-protocol"
-  :version "0.1.1"
+  :version "0.1.2"
   :description "CLOS Apache Arrow / Parquet for cl-stack; implements serdes-protocol :arrow / :parquet"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("babel" "serdes-protocol" "encoding-protocol")
+  :depends-on ("babel" "serdes-protocol" "encoding-protocol"
+               (:version "compression-protocol" "0.3.0"))
   :properties (:cl-repo
                (:ci (:with ("cl-stack-snappy" "cl-stack-zstd" "cl-stack-brotli"
-                            "chipz" "salza2" "crypto-backend-ironclad"))))
+                            "compression-backend-chipz" "crypto-backend-ironclad"))))
   :serial t
   :pathname "src"
   :components ((:file "package")
@@ -27,7 +28,7 @@
   :in-order-to ((test-op (test-op "arrow-protocol/tests"))))
 
 (defsystem "arrow-protocol/tests"
-  :depends-on ("arrow-protocol" "serdes-protocol" "rove")
+  :depends-on ("arrow-protocol" "serdes-protocol" "compression-backend-chipz" "rove")
   :pathname "tests"
   :serial t
   :components ((:file "package")
