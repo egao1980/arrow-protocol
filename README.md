@@ -26,6 +26,19 @@ Native Lisp codec — **not** a CFFI wrap of Arrow C++. Wave-1 covers the type/e
 
 Missing values are `:null` (boolean `nil` stays false). Timestamps are epoch integers in the type’s unit.
 
+**Column storage** follows the Arrow layout. Fixed-width types (int8…uint64, float32/64, date, time, timestamp, duration) keep their values in a specialized vector, e.g. `(simple-array double-float (*))`; bool is a packed bitmap; utf8 / binary are int32 offsets plus one octet vector. Nulls are a separate validity bitmap (octets, LSB-first, 1 = valid, `nil` when there are none) with a cached null count. Decimal, fixed-size-binary, float16, list, struct and map stay boxed (a `simple-vector` with `:null`).
+
+| | |
+|--|--|
+| `make-arrow-array type values` | Lisp values (`:null` for nulls) → typed storage; a value that does not fit signals `arrow-type-error` |
+| `make-typed-arrow-array type data &key validity null-count offsets length` | wraps an existing specialized vector (or bitmap / octets + offsets), no copy |
+| `array-ref`, `array-null-p`, `array-value-octets` | element access; `array-value-octets` → `(values octets start end)` of a utf8 / binary value, no copy |
+| `arrow-array-data` / `-validity` / `-offsets` / `-null-count` / `-kind` / `-element-type` / `-typed-p` | the buffers themselves (do not modify) |
+| `arrow-array-values` | boxed `simple-vector` view, built on first use and cached |
+| `make-column-builder` / `column-builder-push` / `column-builder-finish` | build one column value by value |
+
+IPC write copies each typed buffer into the message body with one `memcpy` ([`buffer-protocol`](https://github.com/egao1980/buffer-protocol)), and IPC read copies each body buffer out the same way. On a big-endian host, or on ABCL (whose CFFI copies a vector instead of pinning it, and whose arrays box floats and 64-bit integers), the same functions run a per-element little-endian loop with identical output.
+
 **Write defaults:** parquet uses dictionary + snappy when `cl-stack-snappy` is loaded, else uncompressed. Nested write is compliant 3-level LIST. Encryption is `AES_GCM_V1` via `crypto-protocol` (`:footer-key`).
 
 Parquet footer field 5 (`key_value_metadata`) stores **`ARROW:schema`** by default — base64 of the IPC schema message, same convention as pyarrow / Arrow C++ `store_schema()`. `:store-schema nil` omits it; decode then uses the SchemaElement tree. `parquet-schema` / `parquet-key-value-metadata` read the footer only.

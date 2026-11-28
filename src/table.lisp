@@ -55,14 +55,11 @@
       (return-from combine-batches (first batches)))
     (make-record-batch
      schema
-     (loop for i from 0 below (length (arrow-schema-fields schema))
-           collect
-           (let ((type (arrow-field-type (nth i (arrow-schema-fields schema))))
-                 (acc '()))
-             (dolist (b batches)
-               (let ((vals (arrow-array-values (nth i (arrow-record-batch-columns b)))))
-                 (loop for v across vals do (push v acc))))
-             (make-arrow-array type (nreverse acc)))))))
+     (loop for f in (arrow-schema-fields schema)
+           for i from 0
+           collect (%concat-arrays (arrow-field-type f)
+                                   (mapcar (lambda (b) (nth i (arrow-record-batch-columns b)))
+                                           batches))))))
 
 (defun table-column (table name)
   (let* ((batch (combine-batches table))
@@ -177,28 +174,22 @@
   (let* ((row-list (coerce rows 'list))
          (schema (or schema (infer-schema row-list)))
          (fields (arrow-schema-fields schema))
-         (cols (mapcar (lambda (f)
-                         (declare (ignore f))
-                         (make-array (length row-list)))
-                       fields)))
-    (loop for row in row-list
-          for i from 0
-          do (loop for f in fields
-                   for col in cols
-                   for j from 0
-                   do (setf (aref col i)
-                            (let ((v (%row-get row (arrow-field-name f))))
-                              (cond
-                                ((null v)
-                                 (if (eq (type-head (arrow-field-type f)) :bool)
-                                     nil
-                                     :null))
-                                (t (coerce-cell v (arrow-field-type f))))))))
-    (make-table
-     schema
-     :columns (loop for f in fields
-                    for col in cols
-                    collect (make-arrow-array (arrow-field-type f) col)))))
+         (n (length row-list))
+         (builders (mapcar (lambda (f) (make-column-builder (arrow-field-type f) n))
+                           fields)))
+    (dolist (row row-list)
+      (loop for f in fields
+            for b in builders
+            do (column-builder-push
+                b
+                (let ((v (%row-get row (arrow-field-name f))))
+                  (cond
+                    ((null v)
+                     (if (eq (type-head (arrow-field-type f)) :bool)
+                         nil
+                         :null))
+                    (t (coerce-cell v (arrow-field-type f))))))))
+    (make-table schema :columns (mapcar #'column-builder-finish builders))))
 
 (defun table-to-rows (table)
   (let* ((batch (combine-batches table))

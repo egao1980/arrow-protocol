@@ -713,6 +713,16 @@
 (defun %write-i64-vec (out n)
   (loop for i from 0 below 8 do (vector-push-extend (ldb (byte 8 (* i 8)) n) out)))
 
+(defun %append-octets (out octets)
+  "Append OCTETS to the adjustable fill-pointer vector OUT in one REPLACE."
+  (let* ((fp (fill-pointer out))
+         (need (+ fp (length octets))))
+    (when (> need (array-dimension out 0))
+      (adjust-array out (max need (* 2 (array-dimension out 0)))))
+    (setf (fill-pointer out) need)
+    (replace out octets :start1 fp)
+    out))
+
 (defun %plain-one (v physical spec)
   (let ((out (make-array 16 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
     (%plain-push out v physical spec)
@@ -771,7 +781,7 @@
                   (babel:string-to-octets v :encoding :utf-8)
                   v)))
        (%write-i32-vec out (length o))
-       (loop for b across o do (vector-push-extend b out))))
+       (%append-octets out o)))
     (:fixed-len-byte-array
      (let ((w (%decimal-flba-width spec type-length)))
        (cond
@@ -806,6 +816,12 @@
 (defun %u32-at (buf i)
   (%u32le buf i))
 
+(defvar *byte-array-octets* nil
+  "True while decoding a column whose values only reach the Arrow array
+   through UNSHRED-LEAF (no repetition): utf8 BYTE_ARRAY values stay octet
+   slices, which the column builder stores as they are, instead of being
+   decoded to strings and encoded again.")
+
 (defun plain-decode (buf start end physical spec count &optional type-length)
   (let ((out (make-array count))
         (p start))
@@ -834,19 +850,12 @@
       (:float
        (loop for i from 0 below count
              do (let ((bits (%u32le buf p)))
-                  (setf (aref out i)
-                        #+sbcl (sb-kernel:make-single-float
-                                (if (>= bits (ash 1 31)) (- bits (ash 1 32)) bits))
-                        #-sbcl 0.0f0)
+                  (setf (aref out i) (%bits-single-float bits))
                   (incf p 4))))
       (:double
        (loop for i from 0 below count
-             do (let ((lo (%u32le buf p))
-                      (hi (%i32le buf (+ p 4))))
-                  (setf (aref out i)
-                        #+sbcl (sb-kernel:make-double-float hi
-                                 (if (>= lo (ash 1 31)) (- lo (ash 1 32)) lo))
-                        #-sbcl 0.0d0)
+             do (progn
+                  (setf (aref out i) (%read-f64-le buf p))
                   (incf p 8))))
       (:byte-array
        (loop for i from 0 below count
@@ -855,7 +864,7 @@
                   (let ((slice (subseq buf p (+ p len))))
                     (incf p len)
                     (setf (aref out i)
-                          (if (eq (type-head spec) :utf8)
+                          (if (and (eq (type-head spec) :utf8) (not *byte-array-octets*))
                               (babel:octets-to-string slice :encoding :utf-8)
                               slice))))))
       (:fixed-len-byte-array
@@ -1016,7 +1025,12 @@
 
 (defun %unique-present (present)
   "→ (values dictionary-vector index-vector) for PRESENT, first-seen order."
-  (let ((seen (make-hash-table :test #'equal))
+  ;; utf8 / binary values arrive as octet vectors: EQUALP compares those by
+  ;; content (EQUAL would compare them by identity). Other keys stay EQUAL.
+  (let ((seen (make-hash-table :test (if (and (plusp (length present))
+                                              (typep (aref present 0) '(vector (unsigned-byte 8))))
+                                         #'equalp
+                                         #'equal)))
         (acc '())
         (count 0)
         (idxs (make-array (length present))))
@@ -1044,6 +1058,8 @@
          (max-rep (pq-node-max-rep leaf))
          (n (length vals))
          (present (%present vals defs max-def))
+         ;; Parquet has no dictionary encoding for BOOLEAN
+         (dictionary (and dictionary (not (eq physical :boolean))))
          (unique (when (and (or dictionary
                                 (member encoding '(:rle-dictionary :plain-dictionary)))
                             (plusp (length present)))
@@ -1198,6 +1214,7 @@
          (type-length (pq-node-type-length leaf))
          (max-def (pq-node-max-def leaf))
          (max-rep (pq-node-max-rep leaf))
+         (*byte-array-octets* (zerop max-rep))
          (end (length octets))
          (got 0)
          (page-i 0))
@@ -1357,7 +1374,7 @@
         (push (cons "ARROW:schema"
                     (%base64-encode (%arrow-schema-ipc-bytes schema)))
               kv))
-      (write-file-metadata mw root nrows (list rg) "arrow-protocol 0.1.1"
+      (write-file-metadata mw root nrows (list rg) "arrow-protocol 0.2.0"
                            :key-value-metadata kv)
       (let* ((meta (tw-bytes mw))
              (magic (if encrypted +pare+ +par1+))
