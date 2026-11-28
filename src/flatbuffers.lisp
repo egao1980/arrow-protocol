@@ -1,10 +1,14 @@
 (in-package #:arrow-protocol)
 
 ;;; Backward FlatBuffers builder. Children written first (higher addresses).
-;;; A "mark" is the absolute index of an object's start in BUF.
+;;; FBB-PREP returns an absolute index into BUF, valid until the next prep
+;;; (the buffer grows at the front). Every other writer returns a "mark":
+;;; the object's distance from the end of the buffer, which growth keeps.
+;;; Alignment is relative to the end too; FBB-FINISH pads the front so the
+;;; finished buffer's length is a multiple of the largest alignment (8).
 
 (defstruct fbb
-  (buf (make-array 1024 :element-type '(unsigned-byte 8)))
+  (buf (make-array 1024 :element-type '(unsigned-byte 8) :initial-element 0))
   (end 1024))
 
 (defun fbb-prep (b n)
@@ -12,17 +16,24 @@
     (let* ((old (fbb-buf b))
            (used (- (length old) (fbb-end b)))
            (new-len (max (* 2 (length old)) (+ used n 64)))
-           (new (make-array new-len :element-type '(unsigned-byte 8))))
+           (new (make-array new-len :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace new old :start1 (- new-len used) :start2 (fbb-end b))
       (setf (fbb-buf b) new
             (fbb-end b) (- new-len used))))
   (decf (fbb-end b) n)
   (fbb-end b))
 
+(defun %fbb-mark (b)
+  "Mark of the current front."
+  (- (length (fbb-buf b)) (fbb-end b)))
+
+(defun %fbb-abs (b mark)
+  (- (length (fbb-buf b)) mark))
+
 (defun fbb-align (b n)
-  (let ((m (mod (- (length (fbb-buf b)) (fbb-end b)) n)))
+  (let ((m (mod (%fbb-mark b) n)))
     (unless (zerop m)
-      (fbb-prep b (- n m)))))
+      (fill (fbb-buf b) 0 :start (fbb-prep b (- n m)) :end (+ (fbb-end b) (- n m))))))
 
 (defun fbb-put-bytes (b pos value nbytes)
   (loop for i from 0 below nbytes
@@ -31,25 +42,22 @@
 (defun fbb-u8 (b v)
   (let ((p (fbb-prep b 1)))
     (setf (aref (fbb-buf b) p) (logand v #xff))
-    p))
+    (%fbb-mark b)))
 
 (defun fbb-u16 (b v)
   (fbb-align b 2)
-  (let ((p (fbb-prep b 2)))
-    (fbb-put-bytes b p v 2)
-    p))
+  (fbb-put-bytes b (fbb-prep b 2) v 2)
+  (%fbb-mark b))
 
 (defun fbb-u32 (b v)
   (fbb-align b 4)
-  (let ((p (fbb-prep b 4)))
-    (fbb-put-bytes b p v 4)
-    p))
+  (fbb-put-bytes b (fbb-prep b 4) v 4)
+  (%fbb-mark b))
 
 (defun fbb-i64 (b v)
   (fbb-align b 8)
-  (let ((p (fbb-prep b 8)))
-    (fbb-put-bytes b p v 8)
-    p))
+  (fbb-put-bytes b (fbb-prep b 8) v 8)
+  (%fbb-mark b))
 
 (defun fbb-string (b string)
   "FlatBuffers string: int32 length, bytes, NUL. Pad after NUL so the
@@ -58,21 +66,22 @@
          (n (length octets))
          (payload (1+ n))
          (pad (mod (- 4 (mod payload 4)) 4)))
+    (fbb-align b 4)
     (when (plusp pad)
-      (fbb-prep b pad))
+      (let ((p (fbb-prep b pad)))
+        (fill (fbb-buf b) 0 :start p :end (+ p pad))))
     (fbb-u8 b 0)
     (let ((p (fbb-prep b n)))
       (replace (fbb-buf b) octets :start1 p))
-    (let ((p (fbb-prep b 4)))
-      (fbb-put-bytes b p n 4)
-      p)))
+    (fbb-put-bytes b (fbb-prep b 4) n 4)
+    (%fbb-mark b)))
 
 (defun fbb-uoffset (b target)
-  "Write uoffset at current pos → TARGET (absolute start index)."
+  "Write a uoffset at the front pointing at mark TARGET."
   (fbb-align b 4)
   (let ((p (fbb-prep b 4)))
-    (fbb-put-bytes b p (- target p) 4)
-    p))
+    (fbb-put-bytes b p (- (%fbb-abs b target) p) 4)
+    (%fbb-mark b)))
 
 (defun fbb-vector (b targets)
   "Offset vector of TARGET marks."
@@ -81,25 +90,19 @@
     (fbb-uoffset b tgt))
   (fbb-u32 b (length targets)))
 
-(defun %spec-size (spec)
-  (ecase (first spec)
-    ((:u8 :bool) 1)
-    (:i16 2)
-    ((:i32 :off) 4)
-    (:i64 8)))
-
 (defun fbb-table (b fields)
   "FIELDS = ((slot-id . spec) ...). spec = (:u8 n) (:bool b) (:i16 n)
-   (:i32 n) (:i64 n) (:off mark). Returns table start mark."
+   (:i32 n) (:i64 n) (:off mark). Returns the table's mark."
   (let* ((present (remove-if-not #'cdr fields))
          (max-id (if present (reduce #'max present :key #'car) -1))
          (nslots (max 0 (1+ max-id)))
-         (field-abs (make-array (max nslots 1) :initial-element 0)))
+         (field-marks (make-array (max nslots 1) :initial-element nil))
+         (object-end (%fbb-mark b)))
     ;; fields, high slot first
     (loop for id from (1- nslots) downto 0
           for spec = (cdr (assoc id present))
           when spec
-            do (setf (aref field-abs id)
+            do (setf (aref field-marks id)
                      (ecase (first spec)
                        (:u8 (fbb-u8 b (second spec)))
                        (:bool (fbb-u8 b (if (second spec) 1 0)))
@@ -108,27 +111,31 @@
                        (:i64 (fbb-i64 b (second spec)))
                        (:off (fbb-uoffset b (second spec))))))
     (fbb-align b 4)
-    (let* ((table (fbb-prep b 4))
-           (obj-size (+ 4 (loop for (id . spec) in present
-                                sum (%spec-size spec))))
+    (fbb-prep b 4)
+    (let* ((table (%fbb-mark b))
+           (obj-size (- table object-end))
            (vt-bytes (+ 4 (* nslots 2))))
       (fbb-align b 2)
       (let ((vt (fbb-prep b vt-bytes)))
         (fbb-put-bytes b vt vt-bytes 2)
         (fbb-put-bytes b (+ vt 2) obj-size 2)
         (loop for i from 0 below nslots
-              for rel = (if (zerop (aref field-abs i))
-                            0
-                            (- (aref field-abs i) table))
-              do (fbb-put-bytes b (+ vt 4 (* i 2)) rel 2))
+              for m = (aref field-marks i)
+              do (fbb-put-bytes b (+ vt 4 (* i 2)) (if m (- table m) 0) 2))
         ;; Official FlatBuffers: soff = table - vtable (positive when
         ;; the vtable sits at a lower address). Reader does table - soff.
-        (fbb-put-bytes b table (logand (- table vt) #xffffffff) 4)
+        (let ((table-abs (%fbb-abs b table)))
+          (fbb-put-bytes b table-abs (logand (- table-abs vt) #xffffffff) 4))
         table))))
 
 (defun fbb-finish (b root)
-  (fbb-align b 4)
-  (fbb-uoffset b root)
+  "The finished buffer: root uoffset first, total length a multiple of 8."
+  (let ((pad (mod (- 8 (mod (+ (%fbb-mark b) 4) 8)) 8)))
+    (when (plusp pad)
+      (let ((p (fbb-prep b pad)))
+        (fill (fbb-buf b) 0 :start p :end (+ p pad)))))
+  (let ((p (fbb-prep b 4)))
+    (fbb-put-bytes b p (- (%fbb-abs b root) p) 4))
   (subseq (fbb-buf b) (fbb-end b)))
 
 ;;; Reader

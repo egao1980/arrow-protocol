@@ -30,8 +30,22 @@
            #:arrow-array-values
            #:arrow-array-length
            #:make-arrow-array
+           #:make-typed-arrow-array
            #:array-ref
            #:array-null-p
+           #:array-value-octets
+           #:arrow-array-kind
+           #:arrow-array-typed-p
+           #:arrow-array-element-type
+           #:arrow-array-null-count
+           #:arrow-array-validity
+           #:arrow-array-data
+           #:arrow-array-offsets
+
+           #:column-builder
+           #:make-column-builder
+           #:column-builder-push
+           #:column-builder-finish
 
            #:arrow-record-batch
            #:arrow-record-batch-p

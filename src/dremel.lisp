@@ -180,8 +180,17 @@
 
 (defun %shred-into (array node table)
   (let ((n (arrow-array-length array)))
-    (loop for i from 0 below n
-          do (%shred-value (array-ref array i) node table 0 0))))
+    (if (and (eq (arrow-array-kind array) :varlen) (null (pq-node-children node)))
+        ;; flat utf8 / binary leaf: octet slices, no string round trip
+        (let ((slot (%ensure-leaf table node))
+              (max-def (pq-node-max-def node)))
+          (dotimes (i n)
+            (multiple-value-bind (octets start end) (array-value-octets array i)
+              (if octets
+                  (%push-leaf slot (subseq octets start end) max-def 0)
+                  (%push-leaf slot :null 0 0)))))
+        (loop for i from 0 below n
+              do (%shred-value (array-ref array i) node table 0 0)))))
 
 (defun %shred-value (value node table parent-def parent-rep)
   (let ((max-def (pq-node-max-def node))
@@ -230,13 +239,20 @@
 
 (defun unshred-leaf (node values defs reps)
   "Reconstruct an arrow-array for a single flat leaf (no children)."
-  (let ((n (length values))
-        (acc '()))
+  (declare (ignore reps))
+  (let* ((n (length values))
+         (type (or (pq-node-arrow-type node) :null))
+         ;; uint32 / uint64 travel as Parquet INT32 / INT64 (two's complement)
+         (unsigned-bits (case (type-head type) (:uint32 32) (:uint64 64)))
+         (b (make-column-builder type n)))
     (loop for i from 0 below n
           for v = (aref values i)
           for d = (aref defs i)
-          do (push (if (>= d (pq-node-max-def node)) v :null) acc))
-    (make-arrow-array (or (pq-node-arrow-type node) :null) (nreverse acc))))
+          do (column-builder-push
+              b (cond ((< d (pq-node-max-def node)) :null)
+                      ((and unsigned-bits (integerp v)) (ldb (byte unsigned-bits 0) v))
+                      (t v))))
+    (column-builder-finish b)))
 
 (defun unshred-column (node values defs reps)
   "Unshred one leaf or a nested subtree. VALUES/DEFS/REPS are parallel

@@ -105,23 +105,6 @@
                  (2 . (:off ,header-mark))
                  (3 . (:i64 ,body-length)))))
 
-(defun %encapsulate (meta body)
-  "IPC continuation + metadata + pad8 + body + pad8."
-  (let* ((meta-pad (- 8 (mod (length meta) 8)))
-         (meta-pad (if (= meta-pad 8) 0 meta-pad))
-         (body-len (length body))
-         (body-pad (- 8 (mod body-len 8)))
-         (body-pad (if (= body-pad 8) 0 body-pad))
-         (out (make-array (+ 8 (length meta) meta-pad body-len body-pad)
-                          :element-type '(unsigned-byte 8) :initial-element 0)))
-    (loop for i from 0 below 4 do (setf (aref out i) #xFF))
-    (let ((mlen (length meta)))
-      (loop for i from 0 below 4
-            do (setf (aref out (+ 4 i)) (ldb (byte 8 (* i 8)) mlen))))
-    (replace out meta :start1 8)
-    (replace out body :start1 (+ 8 (length meta) meta-pad))
-    out))
-
 ;;; Buffer layout per field (depth-first):
 ;;; primitive: validity, values
 ;;; utf8/binary: validity, offsets, data
@@ -138,56 +121,6 @@
 (defun %write-i64le (out pos n)
   (loop for i from 0 below 8
         do (setf (aref out (+ pos i)) (ldb (byte 8 (* i 8)) n))))
-
-(defun %write-f32le (out pos x)
-  (declare (ignore out pos x))
-  nil)
-
-(defun %single-float-bits (x)
-  (let ((s (float x 1.0f0)))
-    #+sbcl (sb-kernel:single-float-bits s)
-    #-sbcl
-    (let ((tmp (make-array 4 :element-type '(unsigned-byte 8))))
-      (setf (aref tmp 0) 0)
-      (error 'arrow-encode-error :message "float encode needs SBCL or a portable IEEE helper"))))
-
-(defun %double-float-bits (x)
-  (let ((s (float x 1.0d0)))
-    #+sbcl
-    (let ((bits (sb-kernel:double-float-bits s)))
-      (if (integerp bits)
-          bits
-          (multiple-value-bind (hi lo) (sb-kernel:double-float-bits s)
-            (logior (logand lo #xffffffff) (ash (logand hi #xffffffff) 32)))))
-    #-sbcl
-    (error 'arrow-encode-error :message "float encode needs SBCL or a portable IEEE helper")))
-
-#+sbcl
-(defun %bits-single-float (bits)
-  (sb-kernel:make-single-float bits))
-
-#+sbcl
-(defun %bits-double-float (hi lo)
-  (sb-kernel:make-double-float hi lo))
-
-#+(or)
-(defun %bits-double-float (bits)
-  nil)
-
-(defun %pack-validity (array)
-  (or (validity-bitmap array)
-      (let* ((n (arrow-array-length array))
-             (b (make-array (ceiling n 8) :element-type '(unsigned-byte 8)
-                            :initial-element #xff)))
-        (when (zerop (mod n 8))
-          (return-from %pack-validity b))
-        (let ((last (1- (length b)))
-              (keep (mod n 8)))
-          (setf (aref b last) (ldb (byte keep 0) #xff))
-          b))))
-
-(defun %physical-int (v)
-  (if (eq v :null) 0 v))
 
 (defun %map-entries (value)
   "Hash-table or alist → vector of {key,value} row mappings."
@@ -208,182 +141,141 @@
            (push ht acc)))))
     (coerce (nreverse acc) 'vector)))
 
+;;; A body chunk is (VECTOR ELEMENT-TYPE COUNT): COUNT ELEMENT-TYPE values
+;;; of VECTOR, written little-endian. Octet chunks are (OCTETS :U8 N).
+;;; Typed column buffers go into the body as they are: no per-value encode.
+
+(defun %chunk-octets (chunk)
+  (* (third chunk) (stack-buffer:element-size (second chunk))))
+
+(defun %octet-chunk (octets &optional (n (length octets)))
+  (list octets :u8 n))
+
+(defun %write-chunk (out pos chunk)
+  (destructuring-bind (vector et count) chunk
+    (if (eq et :u8)
+        (replace out vector :start1 pos :end2 count)
+        (%elements-to-octets vector out pos et :count count))))
+
 (defun %append-buffers (acc nodes buffers body-chunks array)
+  "Push ARRAY's field nodes, buffer descriptors and body chunks (all three
+   lists in reverse order) and return them. BUFFERS entries are
+   (offset length) relative to the body start."
   (declare (ignore acc))
   (let* ((n (arrow-array-length array))
-         (nulls (array-null-count array))
+         (nulls (arrow-array-null-count array))
          (spec (arrow-array-type array))
          (head (type-head spec)))
     (push (list n nulls) nodes)
-    (flet ((add (octets)
-             (let ((off (loop for c in (reverse body-chunks) sum (%pad8 (length c)))))
-               (push (list off (length octets)) buffers)
-               (push octets body-chunks))))
+    (flet ((add (chunk)
+             (let ((off (if body-chunks
+                            (destructuring-bind (o l) (first buffers)
+                              (+ o (%pad8 l)))
+                            0)))
+               (push (list off (%chunk-octets chunk)) buffers)
+               (push chunk body-chunks)))
+           (empty () (%octet-chunk (make-array 0 :element-type '(unsigned-byte 8)))))
       (add (if (zerop nulls)
-               (make-array 0 :element-type '(unsigned-byte 8))
-               (%pack-validity array)))
-      (case head
-        ((:null)
-         (add (make-array 0 :element-type '(unsigned-byte 8))))
+               (empty)
+               (%octet-chunk (validity-bitmap array) (ceiling n 8))))
+      (case (arrow-array-kind array)
+        (:fixed
+         (add (list (arrow-array-data array) (%type-element spec) n)))
         (:bool
-         (let ((b (make-array (ceiling n 8) :element-type '(unsigned-byte 8)
-                              :initial-element 0)))
-           (loop for i from 0 below n
-                 for v = (array-ref array i)
-                 when (eq v t)
-                   do (setf (aref b (ash i -3))
-                            (logior (aref b (ash i -3)) (ash 1 (ldb (byte 3 0) i)))))
-           (add b)))
-        ((:int8 :uint8)
-         (let ((b (make-array n :element-type '(unsigned-byte 8))))
-           (loop for i from 0 below n
-                 do (setf (aref b i) (logand (%physical-int (array-ref array i)) #xff)))
-           (add b)))
-        ((:int16 :uint16)
-         (let ((b (make-array (* n 2) :element-type '(unsigned-byte 8))))
-           (loop for i from 0 below n
-                 for v = (%physical-int (array-ref array i))
-                 do (setf (aref b (* i 2)) (ldb (byte 8 0) v)
-                          (aref b (1+ (* i 2))) (ldb (byte 8 8) v)))
-           (add b)))
-        ((:int32 :uint32 :date32 :time32)
-         (let ((b (make-array (* n 4) :element-type '(unsigned-byte 8))))
-           (loop for i from 0 below n
-                 do (%write-i32le b (* i 4) (%physical-int (array-ref array i))))
-           (add b)))
-        ((:int64 :uint64 :date64 :time64 :timestamp :duration)
-         (let ((b (make-array (* n 8) :element-type '(unsigned-byte 8))))
-           (loop for i from 0 below n
-                 do (%write-i64le b (* i 8) (%physical-int (array-ref array i))))
-           (add b)))
-        ((:float32)
-         (let ((b (make-array (* n 4) :element-type '(unsigned-byte 8))))
-           (loop for i from 0 below n
-                 for v = (array-ref array i)
-                 for bits = (if (eq v :null) 0 (%single-float-bits v))
-                 do (%write-i32le b (* i 4) bits))
-           (add b)))
-        ((:float64)
-         (let ((b (make-array (* n 8) :element-type '(unsigned-byte 8))))
-           (loop for i from 0 below n
-                 for v = (array-ref array i)
-                 do (if (eq v :null)
-                        (%write-i64le b (* i 8) 0)
-                        (%write-i64le b (* i 8) (%double-float-bits v))))
-           (add b)))
-        ((:utf8 :binary)
-         (let* ((lens (loop for i from 0 below n
-                            for v = (array-ref array i)
-                            collect (if (eq v :null)
-                                        0
-                                        (if (stringp v)
-                                            (length (babel:string-to-octets v :encoding :utf-8))
-                                            (length v)))))
-                (total (reduce #'+ lens))
-                (offs (make-array (* (1+ n) 4) :element-type '(unsigned-byte 8)))
-                (data (make-array total :element-type '(unsigned-byte 8)))
-                (acc 0))
-           (%write-i32le offs 0 0)
-           (loop for i from 0 below n
-                 for v = (array-ref array i)
-                 for len in lens
-                 do (unless (eq v :null)
-                      (let ((o (if (stringp v)
-                                   (babel:string-to-octets v :encoding :utf-8)
-                                   v)))
-                        (replace data o :start1 acc))
-                      (incf acc len))
-                    (%write-i32le offs (* (1+ i) 4) acc))
-           (add offs)
-           (add data)))
-        (:decimal
-         (let ((b (make-array (* n 16) :element-type '(unsigned-byte 8) :initial-element 0))
-               (scale (or (decimal-scale spec) 0)))
-           (loop for i from 0 below n
-                 for v = (array-ref array i)
-                 unless (eq v :null)
-                   do (let ((u (decimal-unscaled v scale)))
-                        (loop for k from 0 below 16
-                              do (setf (aref b (+ (* i 16) (- 15 k)))
-                                       (ldb (byte 8 (* k 8))
-                                            (if (minusp u)
-                                                (+ u (ash 1 128))
-                                                u))))))
-           (add b)))
-        (:fixed-size-binary
-         (let* ((w (or (first (type-args spec)) 16))
-                (b (make-array (* n w) :element-type '(unsigned-byte 8) :initial-element 0)))
-           (loop for i from 0 below n
-                 for v = (array-ref array i)
-                 unless (eq v :null)
-                   do (replace b v :start1 (* i w)))
-           (add b)))
-        (:list
-         (let ((offs (make-array (* (1+ n) 4) :element-type '(unsigned-byte 8)))
-               (child-vals '())
-               (offset 0))
-           (%write-i32le offs 0 0)
-           (loop for i from 0 below n
-                 for v = (array-ref array i)
-                 do (unless (eq v :null)
-                      (let ((seq (coerce v 'list)))
-                        (dolist (e seq) (push e child-vals))
-                        (incf offset (length seq))))
-                    (%write-i32le offs (* (1+ i) 4) offset))
-           (add offs)
-           (multiple-value-setq (nodes buffers body-chunks)
-             (%append-buffers nil nodes buffers body-chunks
-                              (make-arrow-array (or (first (type-args spec)) :null)
-                                                (nreverse child-vals))))))
-        (:struct
-         (let ((fields (type-args spec)))
-           (loop for f in fields
-                 for fname = (arrow-field-name f)
-                 for child-vals = (loop for i from 0 below n
-                                        for v = (array-ref array i)
-                                        collect (if (eq v :null)
-                                                    :null
-                                                    (%row-get v fname)))
-                 do (multiple-value-setq (nodes buffers body-chunks)
-                      (%append-buffers nil nodes buffers body-chunks
-                                       (make-arrow-array (arrow-field-type f)
-                                                         child-vals))))))
-        (:map
-         (let* ((kt (or (first (type-args spec)) :utf8))
-                (vt (or (second (type-args spec)) :null))
-                (struct-spec (list :struct
-                                   (make-arrow-field :name "key" :nullable nil :type kt)
-                                   (make-arrow-field :name "value" :type vt)))
-                (entries '())
-                (offs (make-array (* (1+ n) 4) :element-type '(unsigned-byte 8)))
-                (offset 0))
-           (%write-i32le offs 0 0)
-           (loop for i from 0 below n
-                 for v = (array-ref array i)
-                 do (unless (eq v :null)
-                      (let ((ents (%map-entries v)))
-                        (loop for e across ents do (push e entries))
-                        (incf offset (length ents))))
-                    (%write-i32le offs (* (1+ i) 4) offset))
-           (add offs)
-           (multiple-value-setq (nodes buffers body-chunks)
-             (%append-buffers nil nodes buffers body-chunks
-                              (make-arrow-array struct-spec (nreverse entries))))))
-        (t (error 'arrow-unsupported-type :feature head
-                  :message "IPC encode"))))
+         (add (%octet-chunk (arrow-array-data array) (ceiling n 8))))
+        (:varlen
+         (let ((offsets (arrow-array-offsets array)))
+           (add (list offsets :i32 (1+ n)))
+           (add (%octet-chunk (arrow-array-data array) (aref offsets n)))))
+        (t
+         (case head
+           ((:null)
+            (add (empty)))
+           (:decimal
+            (let ((b (make-array (* n 16) :element-type '(unsigned-byte 8) :initial-element 0))
+                  (scale (or (decimal-scale spec) 0)))
+              (loop for i from 0 below n
+                    for v = (array-ref array i)
+                    unless (eq v :null)
+                      do (let ((u (decimal-unscaled v scale)))
+                           (loop for k from 0 below 16
+                                 do (setf (aref b (+ (* i 16) (- 15 k)))
+                                          (ldb (byte 8 (* k 8))
+                                               (if (minusp u)
+                                                   (+ u (ash 1 128))
+                                                   u))))))
+              (add (%octet-chunk b))))
+           (:fixed-size-binary
+            (let* ((w (or (first (type-args spec)) 16))
+                   (b (make-array (* n w) :element-type '(unsigned-byte 8) :initial-element 0)))
+              (loop for i from 0 below n
+                    for v = (array-ref array i)
+                    unless (eq v :null)
+                      do (replace b v :start1 (* i w)))
+              (add (%octet-chunk b))))
+           (:list
+            (let ((offs (make-array (* (1+ n) 4) :element-type '(unsigned-byte 8)))
+                  (child-vals '())
+                  (offset 0))
+              (%write-i32le offs 0 0)
+              (loop for i from 0 below n
+                    for v = (array-ref array i)
+                    do (unless (eq v :null)
+                         (let ((seq (coerce v 'list)))
+                           (dolist (e seq) (push e child-vals))
+                           (incf offset (length seq))))
+                       (%write-i32le offs (* (1+ i) 4) offset))
+              (add (%octet-chunk offs))
+              (multiple-value-setq (nodes buffers body-chunks)
+                (%append-buffers nil nodes buffers body-chunks
+                                 (make-arrow-array (or (first (type-args spec)) :null)
+                                                   (nreverse child-vals))))))
+           (:struct
+            (let ((fields (type-args spec)))
+              (loop for f in fields
+                    for fname = (arrow-field-name f)
+                    for child-vals = (loop for i from 0 below n
+                                           for v = (array-ref array i)
+                                           collect (if (eq v :null)
+                                                       :null
+                                                       (%row-get v fname)))
+                    do (multiple-value-setq (nodes buffers body-chunks)
+                         (%append-buffers nil nodes buffers body-chunks
+                                          (make-arrow-array (arrow-field-type f)
+                                                            child-vals))))))
+           (:map
+            (let* ((kt (or (first (type-args spec)) :utf8))
+                   (vt (or (second (type-args spec)) :null))
+                   (struct-spec (list :struct
+                                      (make-arrow-field :name "key" :nullable nil :type kt)
+                                      (make-arrow-field :name "value" :type vt)))
+                   (entries '())
+                   (offs (make-array (* (1+ n) 4) :element-type '(unsigned-byte 8)))
+                   (offset 0))
+              (%write-i32le offs 0 0)
+              (loop for i from 0 below n
+                    for v = (array-ref array i)
+                    do (unless (eq v :null)
+                         (let ((ents (%map-entries v)))
+                           (loop for e across ents do (push e entries))
+                           (incf offset (length ents))))
+                       (%write-i32le offs (* (1+ i) 4) offset))
+              (add (%octet-chunk offs))
+              (multiple-value-setq (nodes buffers body-chunks)
+                (%append-buffers nil nodes buffers body-chunks
+                                 (make-arrow-array struct-spec (nreverse entries))))))
+           (t (error 'arrow-unsupported-type :feature head
+                     :message "IPC encode"))))))
     (values nodes buffers body-chunks)))
 
-(defun %assemble-body (chunks)
-  (let* ((size (loop for c in chunks sum (%pad8 (length c))))
-         (out (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
-         (pos 0))
-    (dolist (c chunks)
-      (replace out c :start1 pos)
-      (incf pos (%pad8 (length c))))
-    out))
+(defun %write-body (out pos chunks)
+  "Write CHUNKS (in order) at POS, each padded to 8 octets."
+  (dolist (c chunks pos)
+    (%write-chunk out pos c)
+    (incf pos (%pad8 (%chunk-octets c)))))
 
-(defun %record-batch-message (schema columns)
-  (declare (ignore schema))
+(defun %record-batch-parts (columns)
+  "→ (values metadata-octets body-chunks body-length) for one record batch."
   (let ((nodes '())
         (buffers '())
         (chunks '()))
@@ -393,7 +285,7 @@
     (setf nodes (nreverse nodes)
           buffers (nreverse buffers)
           chunks (nreverse chunks))
-    (let* ((body (%assemble-body chunks))
+    (let* ((body-length (loop for c in chunks sum (%pad8 (%chunk-octets c))))
            (b (make-fbb))
            (n (if columns (arrow-array-length (first columns)) 0)))
       ;; FieldNode struct vector: write inline structs then length
@@ -410,8 +302,16 @@
                (rb (fbb-table b `((0 . (:i64 ,n))
                                   (1 . (:off ,nodes-v))
                                   (2 . (:off ,bufs-v)))))
-               (msg (%write-message b 3 rb (length body))))
-          (values (fbb-finish b msg) body))))))
+               (msg (%write-message b 3 rb body-length)))
+          (values (fbb-finish b msg) chunks body-length))))))
+
+(defun %record-batch-message (schema columns)
+  "→ (values metadata-octets body-octets) for one record batch."
+  (declare (ignore schema))
+  (multiple-value-bind (meta chunks body-length) (%record-batch-parts columns)
+    (let ((body (make-array body-length :element-type '(unsigned-byte 8) :initial-element 0)))
+      (%write-body body 0 chunks)
+      (values meta body))))
 
 (defun %schema-message (schema)
   (let ((b (make-fbb)))
@@ -419,83 +319,88 @@
            (msg (%write-message b 1 sch 0)))
       (fbb-finish b msg))))
 
+;;; Encapsulated messages: continuation, metadata length, metadata padded to
+;;; 8, body padded to 8. A message is (META CHUNKS BODY-LENGTH).
+
+(defun %message-prefix-size (meta) (+ 8 (%pad8 (length meta))))
+
+(defun %message-size (message)
+  (destructuring-bind (meta chunks body-length) message
+    (declare (ignore chunks))
+    (+ (%message-prefix-size meta) (%pad8 body-length))))
+
+(defun %write-encapsulated (out pos message)
+  "Write MESSAGE at POS of zero-filled OUT. Returns the position after it."
+  (destructuring-bind (meta chunks body-length) message
+    (%write-uint-le out pos 4 +ipc-continuation+)
+    (%write-uint-le out (+ pos 4) 4 (%pad8 (length meta)))
+    (replace out meta :start1 (+ pos 8))
+    (%write-body out (+ pos (%message-prefix-size meta)) chunks)
+    (+ pos (%message-prefix-size meta) (%pad8 body-length))))
+
+(defun %table-messages (table)
+  "Schema message first, then one message per record batch."
+  (cons (list (%schema-message (arrow-table-schema table)) '() 0)
+        (mapcar (lambda (batch)
+                  (multiple-value-list
+                   (%record-batch-parts (arrow-record-batch-columns batch))))
+                (arrow-table-batches table))))
+
+(defun %encapsulate (meta body)
+  "IPC continuation + metadata + pad8 + body + pad8."
+  (let* ((message (list meta (list (%octet-chunk (coerce body 'octets))) (length body)))
+         (out (make-array (%message-size message)
+                          :element-type '(unsigned-byte 8) :initial-element 0)))
+    (%write-encapsulated out 0 message)
+    out))
+
 (defun encode-ipc-stream (table)
-  (let* ((schema (arrow-table-schema table))
-         (parts (list (%encapsulate (%schema-message schema) #()))))
-    (dolist (batch (arrow-table-batches table))
-      (multiple-value-bind (meta body)
-          (%record-batch-message (arrow-record-batch-schema batch)
-                                 (arrow-record-batch-columns batch))
-        (push (%encapsulate meta body) parts)))
-    ;; EOS
-    (let ((eos (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
-      (loop for i from 0 below 4 do (setf (aref eos i) #xFF))
-      (push eos parts))
-    (let* ((rev (nreverse parts))
-           (n (loop for p in rev sum (length p)))
-           (out (make-array n :element-type '(unsigned-byte 8)))
-           (pos 0))
-      (dolist (p rev)
-        (replace out p :start1 pos)
-        (incf pos (length p)))
-      out)))
+  (let* ((messages (%table-messages table))
+         (out (make-array (+ 8 (loop for m in messages sum (%message-size m)))
+                          :element-type '(unsigned-byte 8) :initial-element 0))
+         (pos 0))
+    (dolist (m messages)
+      (setf pos (%write-encapsulated out pos m)))
+    ;; EOS: continuation + zero length
+    (%write-uint-le out pos 4 +ipc-continuation+)
+    out))
 
 (defun encode-ipc-file (table)
-  (let* ((stream (encode-ipc-stream table))
-         ;; strip EOS (last 8 bytes) for file; footer instead
-         (payload (subseq stream 0 (max 0 (- (length stream) 8))))
+  (let* ((messages (%table-messages table))
+         (payload-size (loop for m in messages sum (%message-size m)))
+         (blocks '())
          (b (make-fbb))
          (sch (%write-schema b (arrow-table-schema table))))
-    ;; Blocks for record batches: we don't store dictionary blocks.
-    ;; Parse payload to find message offsets for the footer.
-    (let ((blocks (%scan-ipc-blocks payload)))
-      (fbb-align b 8)
-      (dolist (blk (reverse (cdr blocks))) ; skip schema block
-        (fbb-i64 b (third blk))
-        (let ((p (fbb-prep b 4)))
-          (fbb-put-bytes b p (second blk) 4))
-        (fbb-i64 b (first blk)))
-      (let* ((rb-v (fbb-u32 b (max 0 (1- (length blocks)))))
-             (footer (fbb-table b `((0 . (:i16 4))
-                                    (1 . (:off ,sch))
-                                    (3 . (:off ,rb-v)))))
-             (fb (fbb-finish b footer))
-             (magic +arrow-magic+)
-             (out (make-array (+ 8 (length payload) (length fb) 10)
-                              :element-type '(unsigned-byte 8) :initial-element 0)))
-        (replace out magic)
-        (replace out payload :start1 8)
-        (replace out fb :start1 (+ 8 (length payload)))
-        (let ((flen (length fb))
-              (p (+ 8 (length payload) (length fb))))
-          (loop for i from 0 below 4
-                do (setf (aref out (+ p i)) (ldb (byte 8 (* i 8)) flen)))
-          (replace out magic :start1 (+ p 4)))
-        out))))
-
-(defun %scan-ipc-blocks (octets)
-  "→ list of (offset meta-length body-length)"
-  (let ((pos 0)
-        (acc '()))
-    (loop while (<= (+ pos 8) (length octets))
-          do (let ((cont (%u32le octets pos))
-                   (mlen (%u32le octets (+ pos 4))))
-               (unless (= cont +ipc-continuation+)
-                 (return))
-               (when (zerop mlen)
-                 (return))
-               (let* ((meta-pad (let ((m (mod mlen 8))) (if (zerop m) 0 (- 8 m))))
-                      (body-off (+ pos 8 mlen meta-pad))
-                      (body-len (%message-body-length octets (+ pos 8) mlen))
-                      (body-pad (let ((m (mod body-len 8))) (if (zerop m) 0 (- 8 m)))))
-                 (push (list pos mlen body-len) acc)
-                 (setf pos (+ body-off body-len body-pad)))))
-    (nreverse acc)))
-
-(defun %message-body-length (octets start mlen)
-  (let* ((meta (subseq octets start (+ start mlen)))
-         (root (fb-root meta)))
-    (fb-i64-field meta root 3 0)))
+    ;; File Block: absolute offset, metaDataLength (prefix + padded
+    ;; flatbuffer), bodyLength. Dictionary blocks are not written.
+    (let ((pos 8))
+      (dolist (m messages)
+        (push (list pos (%message-prefix-size (first m)) (%pad8 (third m))) blocks)
+        (incf pos (%message-size m))))
+    (setf blocks (rest (nreverse blocks)))  ; skip the schema message
+    (fbb-align b 8)
+    (dolist (blk (reverse blocks))
+      ;; struct Block { offset: long; metaDataLength: int; (pad 4) bodyLength: long }
+      ;; written back to front
+      (fbb-i64 b (third blk))
+      (fbb-put-bytes b (fbb-prep b 4) 0 4)
+      (fbb-put-bytes b (fbb-prep b 4) (second blk) 4)
+      (fbb-i64 b (first blk)))
+    (let* ((rb-v (fbb-u32 b (length blocks)))
+           (footer (fbb-table b `((0 . (:i16 4))
+                                  (1 . (:off ,sch))
+                                  (3 . (:off ,rb-v)))))
+           (fb (fbb-finish b footer))
+           (out (make-array (+ 8 payload-size (length fb) 10)
+                            :element-type '(unsigned-byte 8) :initial-element 0))
+           (pos 8))
+      (replace out +arrow-magic+)
+      (dolist (m messages)
+        (setf pos (%write-encapsulated out pos m)))
+      (replace out fb :start1 pos)
+      (%write-uint-le out (+ pos (length fb)) 4 (length fb))
+      (replace out +arrow-magic+ :start1 (+ pos (length fb) 4))
+      out)))
 
 ;;; Decode
 
@@ -574,6 +479,48 @@
 (defun %i64-at (buf i)
   (%i64le buf i))
 
+;;; BUFFERS entries are (offset length) into BODY (absolute positions).
+
+(defun %buffer-range (buffers i body min-length)
+  "(values start length) of buffer I, checked against BODY."
+  (let ((bf (nth i buffers)))
+    (unless bf
+      (error 'arrow-decode-error :message (format nil "missing IPC buffer ~D" i)))
+    (destructuring-bind (start len) bf
+      (when (or (< len min-length) (> (+ start len) (length body)))
+        (error 'arrow-decode-error
+               :message (format nil "IPC buffer ~D (~D octets at ~D) too short or past the body"
+                                i len start)))
+      (values start len))))
+
+(defun %decode-typed (spec kind n nulls validity buffers body buf-i)
+  "One ARROW-ARRAY of typed storage from the body buffers, by bulk copy."
+  (ecase kind
+    (:fixed
+     (let ((et (%type-element spec)))
+       (let ((start (%buffer-range buffers buf-i body (* n (stack-buffer:element-size et)))))
+         (%%make-arrow-array :type spec :kind kind :length n :null-count nulls
+                             :validity validity
+                             :data (%octets-to-elements body start n et)))))
+    (:bool
+     (let ((start (%buffer-range buffers buf-i body (ceiling n 8))))
+       (%%make-arrow-array :type spec :kind kind :length n :null-count nulls
+                           :validity validity
+                           :data (subseq body start (+ start (ceiling n 8))))))
+    (:varlen
+     (let* ((ostart (%buffer-range buffers buf-i body (* 4 (1+ n))))
+            (offsets (%octets-to-elements body ostart (1+ n) :i32))
+            (a (aref offsets 0))
+            (z (aref offsets n))
+            (dstart (%buffer-range buffers (1+ buf-i) body z)))
+       (when (or (minusp a) (< z a))
+         (error 'arrow-decode-error :message "bad utf8 / binary offsets"))
+       (unless (zerop a)
+         (dotimes (i (1+ n)) (decf (aref offsets i) a)))
+       (%%make-arrow-array :type spec :kind kind :length n :null-count nulls
+                           :validity validity :offsets offsets
+                           :data (subseq body (+ dstart a) (+ dstart z)))))))
+
 (defun %decode-array (spec nodes buffers body node-i buf-i)
   (let* ((node (nth node-i nodes))
          (n (first node))
@@ -581,7 +528,8 @@
          (head (type-head spec))
          (vis (nth buf-i buffers))
          (validity (when (and vis (plusp (second vis)) (plusp nulls))
-                     (subseq body (first vis) (+ (first vis) (second vis))))))
+                     (subseq body (first vis)
+                             (+ (first vis) (min (second vis) (ceiling n 8)))))))
     (incf buf-i)
     (labels ((valid (i)
                (or (null validity)
@@ -593,113 +541,13 @@
                         (loop for i from 0 below n
                               collect (if (valid i) (aref raw i) :null)))
                        node-i buf-i)))
+      (let ((kind (%storage-kind spec)))
+        (unless (eq kind :boxed)
+          (return-from %decode-array
+            (values (%decode-typed spec kind n nulls validity buffers body buf-i)
+                    node-i
+                    (+ buf-i (if (eq kind :varlen) 2 1))))))
       (case head
-        (:bool
-         (let* ((bf (nth buf-i buffers))
-                (bytes (subseq body (first bf) (+ (first bf) (second bf))))
-                (raw (make-array n)))
-           (incf buf-i)
-           (loop for i from 0 below n
-                 do (setf (aref raw i)
-                          (plusp (logand (aref bytes (ash i -3))
-                                         (ash 1 (ldb (byte 3 0) i))))))
-           (vals raw)))
-        ((:int8 :uint8)
-         (let* ((bf (nth buf-i buffers))
-                (bytes (subseq body (first bf) (+ (first bf) (second bf))))
-                (raw (make-array n)))
-           (incf buf-i)
-           (loop for i from 0 below n
-                 for v = (aref bytes i)
-                 do (setf (aref raw i)
-                          (if (and (eq head :int8) (>= v 128)) (- v 256) v)))
-           (vals raw)))
-        ((:int16 :uint16)
-         (let* ((bf (nth buf-i buffers))
-                (bytes body)
-                (off (first bf))
-                (raw (make-array n)))
-           (incf buf-i)
-           (loop for i from 0 below n
-                 for v = (%u16le bytes (+ off (* i 2)))
-                 do (setf (aref raw i)
-                          (if (and (eq head :int16) (>= v 32768)) (- v 65536) v)))
-           (vals raw)))
-        ((:int32 :date32 :time32)
-         (let* ((bf (nth buf-i buffers))
-                (off (first bf))
-                (raw (make-array n)))
-           (incf buf-i)
-           (loop for i from 0 below n
-                 do (setf (aref raw i) (%i32-at body (+ off (* i 4)))))
-           (vals raw)))
-        (:uint32
-         (let* ((bf (nth buf-i buffers))
-                (off (first bf))
-                (raw (make-array n)))
-           (incf buf-i)
-           (loop for i from 0 below n
-                 do (setf (aref raw i) (%u32le body (+ off (* i 4)))))
-           (vals raw)))
-        ((:int64 :date64 :time64 :timestamp :duration)
-         (let* ((bf (nth buf-i buffers))
-                (off (first bf))
-                (raw (make-array n)))
-           (incf buf-i)
-           (loop for i from 0 below n
-                 do (setf (aref raw i) (%i64-at body (+ off (* i 8)))))
-           (vals raw)))
-        (:uint64
-         (let* ((bf (nth buf-i buffers))
-                (off (first bf))
-                (raw (make-array n)))
-           (incf buf-i)
-           (loop for i from 0 below n
-                 do (let ((u 0))
-                      (loop for k from 0 below 8
-                            do (setf u (logior u (ash (aref body (+ off (* i 8) k)) (* k 8)))))
-                      (setf (aref raw i) u)))
-           (vals raw)))
-        (:float32
-         (let* ((bf (nth buf-i buffers))
-                (off (first bf))
-                (raw (make-array n)))
-           (incf buf-i)
-           (loop for i from 0 below n
-                 for bits = (%u32le body (+ off (* i 4)))
-                 do (setf (aref raw i)
-                          #+sbcl (sb-kernel:make-single-float
-                                  (if (>= bits (ash 1 31)) (- bits (ash 1 32)) bits))
-                          #-sbcl 0.0f0))
-           (vals raw)))
-        (:float64
-         (let* ((bf (nth buf-i buffers))
-                (off (first bf))
-                (raw (make-array n)))
-           (incf buf-i)
-           (loop for i from 0 below n
-                 for lo = (%u32le body (+ off (* i 8)))
-                 for hi = (%i32-at body (+ off (* i 8) 4))
-                 do (setf (aref raw i)
-                          #+sbcl (sb-kernel:make-double-float hi
-                                   (if (>= lo (ash 1 31)) (- lo (ash 1 32)) lo))
-                          #-sbcl 0.0d0))
-           (vals raw)))
-        ((:utf8 :binary)
-         (let* ((off-b (nth buf-i buffers))
-                (data-b (nth (1+ buf-i) buffers)))
-           (incf buf-i 2)
-           (let ((raw (make-array n)))
-             (loop for i from 0 below n
-                   for a = (%i32-at body (+ (first off-b) (* i 4)))
-                   for z = (%i32-at body (+ (first off-b) (* (1+ i) 4)))
-                   do (setf (aref raw i)
-                            (let ((slice (subseq body (+ (first data-b) a)
-                                                 (+ (first data-b) z))))
-                              (if (eq head :utf8)
-                                  (babel:octets-to-string slice :encoding :utf-8)
-                                  slice))))
-             (vals raw))))
         (:decimal
          (let* ((bf (nth buf-i buffers))
                 (off (first bf))
@@ -797,25 +645,25 @@
            (values (make-arrow-array spec (make-array n :initial-element :null))
                    node-i buf-i)))))))
 
-(defun %read-record-batch (meta body schema)
+(defun %read-record-batch (meta body schema &optional (body-start 0))
+  "Decode the record batch in META whose body starts at BODY-START of BODY."
   (let* ((root (fb-root meta))
          (hdr-id (fb-u8-field meta root 1 0))
          (hdr (fb-indirect meta root 2)))
     (unless (= hdr-id 3)
       (return-from %read-record-batch nil))
-    (let* ((n (fb-i64-field meta hdr 0 0))
+    (let* ((body (if (typep body 'octets) body (coerce body 'octets)))
            (node-ptrs (fb-struct-vector meta hdr 1 16))
            (buf-ptrs (fb-struct-vector meta hdr 2 16))
            (nodes (mapcar (lambda (p)
                             (list (%i64le meta p) (%i64le meta (+ p 8))))
                           (or node-ptrs '())))
            (buffers (mapcar (lambda (p)
-                              (list (%i64le meta p) (%i64le meta (+ p 8))))
+                              (list (+ body-start (%i64le meta p)) (%i64le meta (+ p 8))))
                             (or buf-ptrs '())))
            (node-i 0)
            (buf-i 0)
            (cols '()))
-      (declare (ignore n))
       (dolist (f (arrow-schema-fields schema))
         (multiple-value-bind (arr ni bi)
             (%decode-array (arrow-field-type f) nodes buffers body node-i buf-i)
@@ -823,11 +671,14 @@
           (setf node-i (1+ ni) buf-i bi)))
       (make-record-batch schema (nreverse cols)))))
 
-(defun %parse-messages (octets)
-  (let ((pos 0)
+(defun %parse-messages (octets &key (start 0) (end (length octets)))
+  "Encapsulated messages of OCTETS[START, END) → (values schema batches).
+   Bodies are read in place: no per-message copy."
+  (let ((octets (if (typep octets 'octets) octets (coerce octets 'octets)))
+        (pos start)
         (schema nil)
         (batches '()))
-    (loop while (<= (+ pos 8) (length octets))
+    (loop while (<= (+ pos 8) end)
           do (let ((cont (%u32le octets pos))
                    (mlen (%u32le octets (+ pos 4))))
                (cond
@@ -836,39 +687,39 @@
                  ((zerop mlen)
                   (return))
                  (t
+                  (when (> (+ pos 8 mlen) end)
+                    (error 'arrow-decode-error :message "truncated IPC message metadata"))
                   (let* ((meta (subseq octets (+ pos 8) (+ pos 8 mlen)))
                          (root (fb-root meta))
                          (hdr-id (fb-u8-field meta root 1 0))
                          (body-len (fb-i64-field meta root 3 0))
-                         (meta-pad (let ((m (mod mlen 8))) (if (zerop m) 0 (- 8 m))))
-                         (body-off (+ pos 8 mlen meta-pad))
-                         (body (if (plusp body-len)
-                                   (subseq octets body-off (+ body-off body-len))
-                                   #()))
-                         (body-pad (let ((m (mod body-len 8))) (if (zerop m) 0 (- 8 m)))))
+                         (body-off (+ pos 8 (%pad8 mlen))))
+                    (when (> (+ body-off body-len) end)
+                      (error 'arrow-decode-error :message "truncated IPC message body"))
                     (case hdr-id
                       (1 (setf schema (%read-schema meta (fb-indirect meta root 2))))
                       (3 (when schema
-                           (push (%read-record-batch meta body schema) batches))))
-                    (setf pos (+ body-off body-len body-pad)))))))
+                           (push (%read-record-batch meta octets schema body-off) batches))))
+                    (setf pos (+ body-off (%pad8 body-len))))))))
     (values schema (nreverse batches))))
 
 (defun decode-ipc (octets)
   (when (< (length octets) 6)
     (error 'arrow-decode-error :message "truncated IPC"))
-  (if (and (>= (length octets) 8)
-           (equalp (subseq octets 0 6) +arrow-magic+))
-      (let* ((flen (%u32le octets (- (length octets) 10)))
-             (footer-start (- (length octets) 10 flen))
-             (payload (subseq octets 8 footer-start)))
-        (multiple-value-bind (schema batches) (%parse-messages payload)
+  (let ((octets (if (typep octets 'octets) octets (coerce octets 'octets))))
+    (if (and (>= (length octets) 8)
+             (equalp (subseq octets 0 6) +arrow-magic+))
+        (let* ((flen (%u32le octets (- (length octets) 10)))
+               (footer-start (- (length octets) 10 flen)))
+          (multiple-value-bind (schema batches)
+              (%parse-messages octets :start 8 :end footer-start)
+            (unless schema
+              (error 'arrow-decode-error :message "IPC file missing schema"))
+            (%make-table :schema schema :batches batches)))
+        (multiple-value-bind (schema batches) (%parse-messages octets)
           (unless schema
-            (error 'arrow-decode-error :message "IPC file missing schema"))
-          (%make-table :schema schema :batches batches)))
-      (multiple-value-bind (schema batches) (%parse-messages octets)
-        (unless schema
-          (error 'arrow-decode-error :message "IPC stream missing schema"))
-        (%make-table :schema schema :batches batches))))
+            (error 'arrow-decode-error :message "IPC stream missing schema"))
+          (%make-table :schema schema :batches batches)))))
 
 (defun encode-ipc (table &key (format :file))
   (ecase format
