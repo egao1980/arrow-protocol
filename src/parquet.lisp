@@ -1000,14 +1000,37 @@
     ((:rle-dictionary :plain-dictionary)
      (error 'arrow-encode-error :message "dictionary values go through dict page"))))
 
+;; Floats are keyed by their bit pattern with the halves swapped: SBCL's
+;; EQUAL / EQL hashing of floats (and of integers whose low bits are all
+;; zero, like the bits of 0.5, 1.5, ...) degenerates into O(n) chains. The
+;; swap is a bijection, and bits also keep -0.0 / NaN apart.
+(defun %dictionary-key (v)
+  (typecase v
+    (double-float
+     (let ((b (ldb (byte 64 0) (%double-float-bits v))))
+       (logior (ash (ldb (byte 32 0) b) 32) (ash b -32))))
+    (single-float
+     (let ((b (ldb (byte 32 0) (%single-float-bits v))))
+       (logior (ash (ldb (byte 16 0) b) 16) (ash b -16))))
+    (t v)))
+
 (defun %unique-present (present)
+  "→ (values dictionary-vector index-vector) for PRESENT, first-seen order."
   (let ((seen (make-hash-table :test #'equal))
-        (acc '()))
+        (acc '())
+        (count 0)
+        (idxs (make-array (length present))))
     (loop for v across present
-          unless (nth-value 1 (gethash v seen))
-            do (setf (gethash v seen) (length acc))
-               (push v acc))
-    (values (coerce (nreverse acc) 'vector) seen)))
+          for i from 0
+          for key = (%dictionary-key v)
+          do (multiple-value-bind (idx hit) (gethash key seen)
+               (unless hit
+                 (setf idx count
+                       (gethash key seen) count)
+                 (incf count)
+                 (push v acc))
+               (setf (aref idxs i) idx)))
+    (values (coerce (nreverse acc) 'vector) idxs)))
 
 (defun encode-column-pages (leaf vals defs reps &key (dictionary t) encoding
                             (compression :uncompressed)
@@ -1021,11 +1044,13 @@
          (max-rep (pq-node-max-rep leaf))
          (n (length vals))
          (present (%present vals defs max-def))
+         (unique (when (and (or dictionary
+                                (member encoding '(:rle-dictionary :plain-dictionary)))
+                            (plusp (length present)))
+                   (multiple-value-list (%unique-present present))))
          (enc (or encoding
-                  (if (and dictionary
-                           (plusp (length present))
-                           (< (length (nth-value 0 (%unique-present present)))
-                              (length present)))
+                  (if (and dictionary unique
+                           (< (length (first unique)) (length present)))
                       :rle-dictionary
                       :plain)))
          (parts '())
@@ -1033,10 +1058,9 @@
          (encodings (list :rle :plain))
          (value-enc nil))
     (if (member enc '(:rle-dictionary :plain-dictionary))
-        (multiple-value-bind (dict seen) (%unique-present present)
+        (destructuring-bind (dict idxs) (or unique (list #() #()))
           (let* ((dict-bytes (plain-encode dict physical spec type-length))
                  (hw (make-tw))
-                 (idxs (map 'vector (lambda (v) (gethash v seen)) present))
                  (bw (max 1 (%bit-width (1- (max 1 (length dict)))))))
             (let ((dict-comp (parquet-compress compression dict-bytes)))
               (when footer-key
